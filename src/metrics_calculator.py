@@ -17,10 +17,66 @@ Removed:
 
 from __future__ import annotations
 
-import pandas as pd
-import numpy as np
-from typing import Dict, List
 import logging
+from typing import Dict, List, Sequence
+
+import numpy as np
+import pandas as pd
+
+
+class DataProcessor:
+    """Normalize raw trade data before metric calculations."""
+
+    def __init__(self, expected_numeric: Sequence[str] | None = None):
+        self.expected_numeric = set(expected_numeric or [])
+        self.logger = logging.getLogger(__name__)
+
+    def process(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Return a cleaned dataframe ready for downstream calculations."""
+        if df.empty:
+            return df.copy()
+
+        df = df.copy()
+        df = self._normalize_transaction_type(df)
+        df = self._ensure_datetime(df)
+        df = self._coerce_numeric_columns(df)
+        return df
+
+    def _normalize_transaction_type(self, df: pd.DataFrame) -> pd.DataFrame:
+        if 'transaction_type' not in df.columns:
+            return df
+
+        df['transaction_type'] = (
+            df['transaction_type']
+            .astype(str)
+            .str.upper()
+            .replace({'SELL': 'SALE', 'S': 'SALE', 'B': 'BUY'})
+        )
+        valid_types = {'BUY', 'SALE'}
+        invalid_mask = ~df['transaction_type'].isin(valid_types)
+        if invalid_mask.any():
+            self.logger.warning(
+                "Found %d rows with invalid transaction_type; marking as missing",
+                invalid_mask.sum(),
+            )
+            df.loc[invalid_mask, 'transaction_type'] = pd.NA
+        return df
+
+    def _ensure_datetime(self, df: pd.DataFrame) -> pd.DataFrame:
+        if 'trade_date' not in df.columns:
+            return df
+
+        df['trade_date'] = pd.to_datetime(df['trade_date'], errors='coerce')
+        if 'trade_hour' not in df.columns:
+            df['trade_hour'] = df['trade_date'].dt.hour
+        return df
+
+    def _coerce_numeric_columns(self, df: pd.DataFrame) -> pd.DataFrame:
+        for col in self.expected_numeric:
+            if col not in df.columns:
+                df[col] = 0.0
+            df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0.0)
+        return df
 
 
 class TradingMetricsCalculator:
@@ -31,13 +87,16 @@ class TradingMetricsCalculator:
         self.risk_free_rate = config.get('metrics', {}).get('risk_free_rate', 0.05)
         self.trading_days = config.get('metrics', {}).get('trading_days_per_year', 252)
         self.logger = logging.getLogger(__name__)
+        self.data_processor = DataProcessor(
+            expected_numeric=('pnl', 'trade_value', 'quantity', 'price', 'holding_period_minutes')
+        )
 
     def calculate_all_metrics(self, df: pd.DataFrame) -> Dict:
         """Calculate all essential trading metrics"""
         if df.empty:
             return self._empty_metrics()
 
-        df = self._prepare_dataframe(df)
+        df = self.data_processor.process(df)
         
         metrics = {
             # Core Performance
@@ -96,24 +155,6 @@ class TradingMetricsCalculator:
             'persona_traits': {}
         }
 
-    def _prepare_dataframe(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Prepare and validate dataframe columns"""
-        df = df.copy()
-        
-        # Normalize transaction type
-        if 'transaction_type' in df.columns:
-            df['transaction_type'] = df['transaction_type'].astype(str).str.upper()
-            df['transaction_type'] = df['transaction_type'].replace({'SELL': 'SALE'})
-        
-        # Ensure date column is datetime
-        if 'trade_date' in df.columns and not pd.api.types.is_datetime64_any_dtype(df['trade_date']):
-            df['trade_date'] = pd.to_datetime(df['trade_date'], errors='coerce')
-        
-        # Add trade_hour if not present
-        if 'trade_date' in df.columns and 'trade_hour' not in df.columns:
-            df['trade_hour'] = df['trade_date'].dt.hour
-        
-        return df
 
     # =========================================================
     # Core Performance Metrics
